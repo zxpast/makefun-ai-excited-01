@@ -1,686 +1,434 @@
-// ai-excited-01 entry: "The Whale Came for the Moon"
-// A lone humpback whale, mountain-sized, breaching diagonally out of a night
-// sea straight toward a huge golden moon — a tiny sailboat below gives the
-// scale away. Drawn entirely in code: flat poster style, high contrast,
-// one diagonal of motion, one bright focal point. No faces, no hands, no
-// photographic texture — nothing that can smear or break at 300 px.
-// Node 22, standard library only (node:fs, node:zlib). Deterministic:
-// fixed-seed PRNG, no clock, no network. Both runs write identical bytes.
-
-import { mkdirSync, writeFileSync } from "node:fs";
-import { deflateSync } from "node:zlib";
+// Whale vs Moon — a flat-poster night scene, 1024x1024.
+// Own implementation: RGB framebuffer, scanline polygons, antialiased
+// discs, soft radial glows, a cubic-bezier whale spine with a width
+// profile, a hand-defined 5x7 bitmap font, and a hand-rolled PNG
+// encoder (filter-0 scanlines, zlib deflate level 9, CRC32).
+// Deterministic: fixed-seed PRNG, no clock, no Math.random, no network.
+import * as fs from "node:fs";
+import * as zlib from "node:zlib";
 
 const W = 1024;
 const H = 1024;
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+const fb = new Uint8Array(W * H * 3);
 
-// ---------- deterministic PRNG (mulberry32) ----------
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+// ---- deterministic PRNG (mulberry32, fixed seed) ----
+let rngState = 0x9e3779b9;
+function rnd(): number {
+  rngState |= 0;
+  rngState = (rngState + 0x6d2b79f5) | 0;
+  let t = Math.imul(rngState ^ (rngState >>> 15), 1 | rngState);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
-const rand = mulberry32(20261116);
+function rndRange(a: number, b: number): number {
+  return a + (b - a) * rnd();
+}
 
-// ---------- framebuffer (float RGB 0..255) ----------
-const fb = new Float32Array(W * H * 3);
-
+// ---- colour helpers ----
 type RGB = [number, number, number];
-type Pt = [number, number];
-
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 function mix(c1: RGB, c2: RGB, t: number): RGB {
   return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
 }
-
-// source-over blend at integer pixel
-function blend(x: number, y: number, c: RGB, a: number): void {
-  if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return;
-  const i = (y * W + x) * 3;
-  const ia = 1 - a;
-  fb[i] = c[0] * a + fb[i] * ia;
-  fb[i + 1] = c[1] * a + fb[i + 1] * ia;
-  fb[i + 2] = c[2] * a + fb[i + 2] * ia;
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
 }
 
-// vertical gradient fill of a rectangle
-function vgrad(x0: number, y0: number, x1: number, y1: number, stops: [number, RGB][]): void {
-  for (let y = y0; y < y1; y++) {
-    const t = (y - y0) / Math.max(1, y1 - y0 - 1);
-    let c: RGB = stops[stops.length - 1][1];
-    for (let s = 0; s + 1 < stops.length; s++) {
-      if (t >= stops[s][0] && t <= stops[s + 1][0]) {
-        const u = (t - stops[s][0]) / (stops[s + 1][0] - stops[s][0]);
-        c = mix(stops[s][1], stops[s + 1][1], u);
-        break;
-      }
-    }
-    for (let x = x0; x < x1; x++) {
+// ---- pixel primitives ----
+function put(x: number, y: number, c: RGB, alpha: number): void {
+  const xi = Math.round(x);
+  const yi = Math.round(y);
+  if (xi < 0 || xi >= W || yi < 0 || yi >= H) return;
+  const i = (yi * W + xi) * 3;
+  const a = clamp(alpha, 0, 1);
+  fb[i] = Math.round(fb[i] * (1 - a) + c[0] * a);
+  fb[i + 1] = Math.round(fb[i + 1] * (1 - a) + c[1] * a);
+  fb[i + 2] = Math.round(fb[i + 2] * (1 - a) + c[2] * a);
+}
+function fillRect(x0: number, y0: number, x1: number, y1: number, c: RGB): void {
+  for (let y = Math.max(0, Math.floor(y0)); y < Math.min(H, Math.ceil(y1)); y++) {
+    for (let x = Math.max(0, Math.floor(x0)); x < Math.min(W, Math.ceil(x1)); x++) {
       const i = (y * W + x) * 3;
-      fb[i] = c[0];
-      fb[i + 1] = c[1];
-      fb[i + 2] = c[2];
+      fb[i] = c[0]; fb[i + 1] = c[1]; fb[i + 2] = c[2];
     }
   }
 }
-
-// antialiased filled circle
-function disc(cx: number, cy: number, r: number, c: RGB, a: number): void {
-  const x0 = Math.max(0, Math.floor(cx - r - 1));
-  const x1 = Math.min(W - 1, Math.ceil(cx + r + 1));
-  const y0 = Math.max(0, Math.floor(cy - r - 1));
-  const y1 = Math.min(H - 1, Math.ceil(cy + r + 1));
+// Antialiased filled disc.
+function disc(cx: number, cy: number, r: number, c: RGB, alpha: number): void {
+  if (r <= 0) return;
+  const x0 = Math.floor(cx - r - 1);
+  const x1 = Math.ceil(cx + r + 1);
+  const y0 = Math.floor(cy - r - 1);
+  const y1 = Math.ceil(cy + r + 1);
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
-      const cov = clamp(r - d + 0.5, 0, 1);
-      if (cov > 0) blend(x, y, c, a * cov);
+      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+      const cov = clamp(r + 0.5 - d, 0, 1);
+      if (cov > 0) put(x, y, c, alpha * cov);
     }
   }
 }
-
-// soft radial glow
-function glow(cx: number, cy: number, r: number, c: RGB, peak: number): void {
-  const x0 = Math.max(0, Math.floor(cx - r));
-  const x1 = Math.min(W - 1, Math.ceil(cx + r));
-  const y0 = Math.max(0, Math.floor(cy - r));
-  const y1 = Math.min(H - 1, Math.ceil(cy + r));
+// Soft radial glow: alpha falls off quadratically to radius R.
+function glow(cx: number, cy: number, R: number, c: RGB, strength: number): void {
+  const x0 = Math.max(0, Math.floor(cx - R));
+  const x1 = Math.min(W - 1, Math.ceil(cx + R));
+  const y0 = Math.max(0, Math.floor(cy - R));
+  const y1 = Math.min(H - 1, Math.ceil(cy + R));
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy) / r;
-      if (d < 1) {
-        const a = peak * (1 - d) * (1 - d);
-        blend(x, y, c, a);
-      }
+      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / R;
+      if (d >= 1) continue;
+      const a = strength * (1 - d) * (1 - d);
+      put(x, y, c, a);
     }
   }
 }
-
-// scanline polygon fill
-function fillPoly(pts: Pt[], c: RGB, a: number): void {
-  let minY = Infinity;
-  let maxY = -Infinity;
+// Scanline polygon fill.
+function polygon(pts: Array<[number, number]>, c: RGB, alpha: number): void {
+  let minY = H;
+  let maxY = 0;
   for (const p of pts) {
-    minY = Math.min(minY, p[1]);
-    maxY = Math.max(maxY, p[1]);
+    minY = Math.min(minY, Math.floor(p[1]));
+    maxY = Math.max(maxY, Math.ceil(p[1]));
   }
-  const y0 = Math.max(0, Math.floor(minY));
-  const y1 = Math.min(H - 1, Math.ceil(maxY));
-  for (let y = y0; y <= y1; y++) {
-    const yc = y + 0.5;
+  for (let y = Math.max(0, minY); y <= Math.min(H - 1, maxY); y++) {
     const xs: number[] = [];
     for (let i = 0; i < pts.length; i++) {
-      const p1 = pts[i];
-      const p2 = pts[(i + 1) % pts.length];
-      if ((p1[1] <= yc && p2[1] > yc) || (p2[1] <= yc && p1[1] > yc)) {
-        const t = (yc - p1[1]) / (p2[1] - p1[1]);
-        xs.push(p1[0] + t * (p2[0] - p1[0]));
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      if ((a[1] <= y && b[1] > y) || (b[1] <= y && a[1] > y)) {
+        const t = (y - a[1]) / (b[1] - a[1]);
+        xs.push(a[0] + t * (b[0] - a[0]));
       }
     }
-    xs.sort((u, v) => u - v);
+    xs.sort((p, q) => p - q);
     for (let k = 0; k + 1 < xs.length; k += 2) {
-      const xa = Math.max(0, Math.ceil(xs[k] - 0.5));
-      const xb = Math.min(W - 1, Math.floor(xs[k + 1] - 0.5));
-      for (let x = xa; x <= xb; x++) blend(x, y, c, a);
+      for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(W - 1, Math.floor(xs[k + 1])); x++) {
+        put(x, y, c, alpha);
+      }
     }
   }
 }
+// Thick line as a chain of discs.
+function thickLine(x0: number, y0: number, x1: number, y1: number, r: number, c: RGB, alpha: number): void {
+  const len = Math.sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+  const steps = Math.max(1, Math.ceil(len / Math.max(1, r)));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    disc(lerp(x0, x1, t), lerp(y0, y1, t), r, c, alpha);
+  }
+}
 
-// stroke a polyline by stamping discs along it
-function stroke(pts: Pt[], width: number, c: RGB, a: number): void {
-  for (let i = 0; i + 1 < pts.length; i++) {
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const d = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
-    const steps = Math.max(1, Math.ceil(d / 0.5));
-    for (let s = 0; s <= steps; s++) {
-      const t = s / steps;
-      disc(p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t, width / 2, c, a);
+// ---- palette ----
+const SKY_TOP: RGB = [8, 14, 46];
+const SKY_HOR: RGB = [22, 30, 70];
+const SEA_TOP: RGB = [10, 28, 58];
+const SEA_BOT: RGB = [5, 15, 34];
+const MOON_GOLD: RGB = [247, 201, 72];
+const MOON_PALE: RGB = [255, 233, 168];
+const MOON_DEEP: RGB = [232, 184, 74];
+const WHALE: RGB = [34, 56, 110];
+const WHALE_DARK: RGB = [24, 40, 84];
+const BELLY: RGB = [220, 230, 242];
+const RIM: RGB = [255, 201, 77];
+const WHITE: RGB = [255, 255, 255];
+const SPRAY: RGB = [235, 244, 255];
+
+// ---- background: sky gradient, then sea ----
+for (let y = 0; y < H; y++) {
+  let c: RGB;
+  if (y < 648) {
+    c = mix(SKY_TOP, SKY_HOR, y / 648);
+  } else {
+    c = mix(SEA_TOP, SEA_BOT, (y - 648) / (H - 648));
+  }
+  for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 3;
+    fb[i] = c[0]; fb[i + 1] = c[1]; fb[i + 2] = c[2];
+  }
+}
+// Horizon shimmer line.
+for (let x = 0; x < W; x++) {
+  put(x, 648, [70, 95, 140], 0.35);
+  put(x, 649, [50, 75, 120], 0.3);
+}
+
+// ---- stars (sky only, keep clear of the moon) ----
+const MOON: { x: number; y: number; r: number } = { x: 775, y: 215, r: 148 };
+for (let i = 0; i < 260; i++) {
+  const sx = rndRange(0, W);
+  const sy = rndRange(0, 600);
+  const dm = Math.sqrt((sx - MOON.x) * (sx - MOON.x) + (sy - MOON.y) * (sy - MOON.y));
+  if (dm < MOON.r + 28) continue;
+  const b = rndRange(0.35, 1);
+  const s = rnd() < 0.12 ? 2 : 1;
+  disc(sx, sy, s === 2 ? 1.8 : 1.1, [255, 250, 230], b);
+  if (rnd() < 0.08) {
+    // tiny cross sparkle
+    put(sx + 3, sy, WHITE, b * 0.6);
+    put(sx - 3, sy, WHITE, b * 0.6);
+    put(sx, sy + 3, WHITE, b * 0.6);
+    put(sx, sy - 3, WHITE, b * 0.6);
+  }
+}
+
+// ---- moon: halo, disc, shading, craters ----
+glow(MOON.x, MOON.y, 330, MOON_GOLD, 0.34);
+glow(MOON.x, MOON.y, 215, MOON_PALE, 0.5);
+disc(MOON.x, MOON.y, MOON.r, MOON_GOLD, 1);
+disc(MOON.x - 14, MOON.y - 16, MOON.r - 16, MOON_PALE, 0.85);
+disc(MOON.x + 34, MOON.y + 42, MOON.r - 52, MOON_GOLD, 0.35);
+const craters: Array<[number, number, number]> = [
+  [725, 170, 17], [800, 150, 12], [835, 235, 20], [745, 265, 13],
+  [795, 285, 9], [860, 180, 10], [700, 225, 8],
+];
+for (const [cx, cy, cr] of craters) disc(cx, cy, cr, MOON_DEEP, 0.5);
+// Bright rim on the moon's lower-left edge (facing the whale).
+for (let a = Math.PI * 0.55; a <= Math.PI * 1.05; a += 0.02) {
+  disc(MOON.x + Math.cos(a) * (MOON.r - 2), MOON.y + Math.sin(a) * (MOON.r - 2), 3, MOON_PALE, 0.9);
+}
+
+// ---- moon reflection: shimmering gold column on the water ----
+glow(775, 820, 190, MOON_GOLD, 0.16);
+for (let i = 0; i < 150; i++) {
+  const ry = rndRange(660, 1000);
+  const depth = (ry - 660) / 340; // 0 at horizon, 1 at bottom
+  const halfW = lerp(28, 95, depth) * rndRange(0.5, 1.3);
+  const cx = 775 + rndRange(-halfW, halfW);
+  const len = rndRange(8, 46) * (0.6 + depth);
+  const a = lerp(0.9, 0.28, depth) * rndRange(0.5, 1);
+  thickLine(cx - len / 2, ry, cx + len / 2, ry, rndRange(1.2, 2.6), MOON_GOLD, a);
+}
+// A few dark sea strokes for texture.
+for (let i = 0; i < 60; i++) {
+  const ry = rndRange(670, 990);
+  const cx = rndRange(0, W);
+  const len = rndRange(20, 80);
+  thickLine(cx, ry, cx + len, ry, 1.4, [4, 12, 28], rndRange(0.2, 0.45));
+}
+
+// ---- whale: cubic-bezier spine + width profile ----
+// Spine: tail bottom-left -> head top-right, head overlapping moon's lower edge.
+const P0: [number, number] = [95, 905];
+const P1: [number, number] = [215, 755];
+const P2: [number, number] = [440, 555];
+const P3: [number, number] = [705, 330];
+function bezier(t: number): [number, number] {
+  const u = 1 - t;
+  const x = u * u * u * P0[0] + 3 * u * u * t * P1[0] + 3 * u * t * t * P2[0] + t * t * t * P3[0];
+  const y = u * u * u * P0[1] + 3 * u * u * t * P1[1] + 3 * u * t * t * P2[1] + t * t * t * P3[1];
+  return [x, y];
+}
+function bezierTan(t: number): [number, number] {
+  const u = 1 - t;
+  const x = 3 * u * u * (P1[0] - P0[0]) + 6 * u * t * (P2[0] - P1[0]) + 3 * t * t * (P3[0] - P2[0]);
+  const y = 3 * u * u * (P1[1] - P0[1]) + 6 * u * t * (P2[1] - P1[1]) + 3 * t * t * (P3[1] - P2[1]);
+  const len = Math.sqrt(x * x + y * y) || 1;
+  return [x / len, y / len];
+}
+// Width knots (t -> full width in px).
+const WIDTH_KNOTS: Array<[number, number]> = [
+  [0, 16], [0.12, 52], [0.3, 108], [0.5, 146], [0.68, 138], [0.85, 116], [1, 82],
+];
+function widthAt(t: number): number {
+  for (let i = 0; i + 1 < WIDTH_KNOTS.length; i++) {
+    const a = WIDTH_KNOTS[i];
+    const b = WIDTH_KNOTS[i + 1];
+    if (t >= a[0] && t <= b[0]) {
+      const f = (t - a[0]) / (b[0] - a[0]);
+      const s = f * f * (3 - 2 * f); // smoothstep
+      return lerp(a[1], b[1], s);
     }
   }
+  return WIDTH_KNOTS[WIDTH_KNOTS.length - 1][1];
+}
+// Tail fluke first (behind the body): two lobes fanning from the tail tip.
+polygon([[108, 888], [58, 832], [16, 806], [72, 884]], WHALE_DARK, 1);
+polygon([[108, 892], [62, 948], [24, 966], [80, 908]], WHALE_DARK, 1);
+disc(16, 806, 7, WHALE_DARK, 1);
+disc(24, 966, 7, WHALE_DARK, 1);
+// Body: overlapping discs along the spine (dark indigo back).
+for (let t = 0; t <= 1.0001; t += 0.002) {
+  const [x, y] = bezier(t);
+  disc(x, y, widthAt(t) / 2, WHALE, 1);
+}
+// Darker top shading along the spine centre (depth on the back).
+for (let t = 0.05; t <= 0.98; t += 0.004) {
+  const [x, y] = bezier(t);
+  const [tx, ty] = bezierTan(t);
+  const nx = -ty;
+  const ny = tx;
+  disc(x - nx * widthAt(t) * 0.18, y - ny * widthAt(t) * 0.18, widthAt(t) * 0.22, WHALE_DARK, 0.55);
+}
+// Pale belly: discs offset toward the south-east normal (belly side).
+for (let t = 0.06; t <= 0.99; t += 0.003) {
+  const [x, y] = bezier(t);
+  const [tx, ty] = bezierTan(t);
+  const nx = -ty;
+  const ny = tx;
+  const w = widthAt(t);
+  disc(x + nx * w * 0.32, y + ny * w * 0.32, w * 0.30, BELLY, 0.96);
+}
+// Gold rim of moonlight along the moon-facing (north-west) edge.
+for (let t = 0.02; t <= 1.0; t += 0.002) {
+  const [x, y] = bezier(t);
+  const [tx, ty] = bezierTan(t);
+  const nx = -ty;
+  const ny = tx;
+  const w = widthAt(t);
+  disc(x - nx * w * 0.47, y - ny * w * 0.47, 3.2, RIM, 0.95);
+}
+// Pectoral fin: a dark fin sweeping down from the mid-body.
+{
+  const [bx, by] = bezier(0.58);
+  const [tx, ty] = bezierTan(0.58);
+  const nx = -ty;
+  const ny = tx;
+  const w = widthAt(0.58);
+  const baseX = bx + nx * w * 0.30;
+  const baseY = by + ny * w * 0.30;
+  polygon(
+    [[baseX - tx * 34, baseY - ty * 34], [baseX + tx * 30, baseY + ty * 30],
+     [baseX + tx * 78 + nx * 92, baseY + ty * 78 + ny * 92],
+     [baseX + tx * 30 + nx * 108, baseY + ty * 30 + ny * 108]],
+    WHALE_DARK, 1,
+  );
+  disc(baseX + tx * 78 + nx * 92, baseY + ty * 78 + ny * 92, 6, WHALE_DARK, 1);
+}
+// Head: the body discs already round it off; add a pale jaw patch so the
+// head reads against the moon, and keep the gold rim crossing in front.
+{
+  const [hx, hy] = bezier(0.985);
+  disc(hx + 14, hy + 22, 26, BELLY, 0.9);
+  disc(hx, hy, 10, WHALE, 0.9);
 }
 
-function cubic(p0: Pt, p1: Pt, p2: Pt, p3: Pt, n: number): Pt[] {
-  const out: Pt[] = [];
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = 1 - t;
-    out.push([
-      u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
-      u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1],
-    ]);
-  }
-  return out;
+// ---- spray where the tail leaves the water ----
+for (let i = 0; i < 110; i++) {
+  const a = rndRange(-Math.PI * 0.95, -Math.PI * 0.05);
+  const r = rndRange(6, 150) * (rnd() < 0.5 ? 1 : 0.55);
+  const sx = 100 + Math.cos(a) * r * 1.15;
+  const sy = 892 + Math.sin(a) * r * 0.75;
+  disc(sx, sy, rndRange(1.5, 5.5), SPRAY, rndRange(0.5, 0.95));
+}
+// A few arcing spray streaks.
+for (let i = 0; i < 14; i++) {
+  const a0 = rndRange(Math.PI * 1.05, Math.PI * 1.55);
+  const r0 = rndRange(40, 120);
+  const x0 = 100 + Math.cos(a0) * r0;
+  const y0 = 892 + Math.sin(a0) * r0 * 0.7;
+  thickLine(x0, y0, x0 + rndRange(-30, 30), y0 - rndRange(14, 42), 2.2, SPRAY, 0.8);
+}
+// White splash ring on the water around the tail.
+for (let a = 0; a < Math.PI * 2; a += 0.05) {
+  const ex = 105 + Math.cos(a) * 118;
+  const ey = 898 + Math.sin(a) * 20;
+  if (ey > 660) disc(ex, ey, 2.6, WHITE, 0.75);
 }
 
-function quad(p0: Pt, pc: Pt, p1: Pt, n: number): Pt[] {
-  const out: Pt[] = [];
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = 1 - t;
-    out.push([
-      u * u * p0[0] + 2 * u * t * pc[0] + t * t * p1[0],
-      u * u * p0[1] + 2 * u * t * pc[1] + t * t * p1[1],
-    ]);
-  }
-  return out;
+// ---- tiny sailboat, bottom-right (the scale joke) ----
+{
+  const bx = 845;
+  const by = 818; // waterline
+  // Mast + sails.
+  thickLine(bx, by, bx, 758, 2.2, [20, 26, 44], 1);
+  polygon([[bx + 3, 762], [bx + 3, 812], [bx + 52, 812]], [242, 245, 250], 1);
+  polygon([[bx - 3, 776], [bx - 3, 812], [bx - 30, 812]], [201, 214, 232], 1);
+  disc(bx, 756, 3.5, MOON_GOLD, 1);
+  // Hull.
+  polygon([[bx - 46, by], [bx + 48, by], [bx + 34, by + 22], [bx - 32, by + 22]], [14, 21, 38], 1);
+  thickLine(bx - 46, by, bx + 48, by, 1.6, RIM, 0.9);
+  // Little reflection under the hull.
+  thickLine(bx - 30, by + 30, bx + 28, by + 30, 1.6, [120, 140, 175], 0.5);
+  thickLine(bx - 18, by + 40, bx + 16, by + 40, 1.4, [120, 140, 175], 0.35);
 }
 
-function fillRect(x: number, y: number, w: number, h: number, c: RGB, a: number): void {
-  for (let yy = Math.max(0, Math.floor(y)); yy < Math.min(H, y + h); yy++) {
-    for (let xx = Math.max(0, Math.floor(x)); xx < Math.min(W, x + w); xx++) {
-      blend(xx, yy, c, a);
-    }
-  }
-}
-
-// ---------- 5x7 bitmap font (letters used by the caption) ----------
+// ---- caption: hand-defined 5x7 bitmap font, scale 3 ----
+// Each glyph: 7 rows of 5 chars, "#" = on.
 const FONT: Record<string, string[]> = {
-  H: ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
-  E: ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
-  Y: ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."],
-  J: ["..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."],
-  U: ["#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
-  D: ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
-  G: [".####", "#....", "#....", "#.###", "#...#", "#...#", ".###."],
-  C: [".####", "#....", "#....", "#....", "#....", "#....", ".####"],
-  A: [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
-  M: ["#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"],
-  F: ["#####", "#....", "#....", "####.", "#....", "#....", "#...."],
-  O: [".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
-  R: ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
-  T: ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
-  N: ["#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"],
-  "-": [".....", ".....", ".....", "#####", ".....", ".....", "....."],
   " ": [".....", ".....", ".....", ".....", ".....", ".....", "....."],
+  "-": [".....", ".....", ".....", "#####", ".....", ".....", "....."],
+  ".": [".....", ".....", ".....", ".....", ".....", ".##..", ".##.."],
+  "A": [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+  "C": [".####", "#....", "#....", "#....", "#....", "#....", ".####"],
+  "D": ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
+  "E": ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
+  "F": ["#####", "#....", "#....", "####.", "#....", "#....", "#...."],
+  "G": [".####", "#....", "#....", "#.###", "#...#", "#...#", ".###."],
+  "H": ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+  "J": ["..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."],
+  "M": ["#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"],
+  "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"],
+  "O": [".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
+  "R": ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
+  "T": ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
+  "U": ["#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
+  "Y": ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."],
 };
-
-function drawText(s: string, x: number, y: number, scale: number, c: RGB, a: number): void {
-  let cx = x;
-  for (const ch of s) {
-    const g = FONT[ch];
-    if (g) {
-      for (let r = 0; r < 7; r++) {
-        for (let col = 0; col < 5; col++) {
-          if (g[r][col] === "#") {
-            fillRect(cx + col * scale, y + r * scale, scale, scale, c, a);
-          }
+function drawText(text: string, x0: number, y0: number, scale: number, c: RGB): void {
+  let cx = x0;
+  for (const ch of text) {
+    const g = FONT[ch] ?? FONT[" "];
+    for (let row = 0; row < 7; row++) {
+      for (let col = 0; col < 5; col++) {
+        if (g[row][col] === "#") {
+          fillRect(cx + col * scale, y0 + row * scale, cx + (col + 1) * scale, y0 + (row + 1) * scale, c);
         }
       }
     }
     cx += 6 * scale;
   }
 }
+const CAPTION = "HEY JUDGE - HE CAME FOR THE MOON.";
+drawText(CAPTION, 34, 38, 3, [10, 16, 40]);
+drawText(CAPTION, 32, 36, 3, MOON_PALE);
 
-// ---------- palette ----------
-const SKY_TOP: RGB = [5, 9, 20];
-const SKY_MID: RGB = [13, 27, 61];
-const SKY_HOR: RGB = [29, 58, 107];
-const MOON_CORE: RGB = [255, 246, 207];
-const MOON_EDGE: RGB = [242, 193, 78];
-const MOON_GLOW: RGB = [255, 217, 138];
-const WHALE_BACK: RGB = [22, 34, 77];
-const WHALE_BELLY: RGB = [207, 230, 247];
-const RIM: RGB = [255, 217, 138];
-const SEA_TOP: RGB = [18, 58, 99];
-const SEA_BOT: RGB = [5, 15, 34];
-const FOAM: RGB = [235, 245, 255];
-const SPRAY: RGB = [190, 225, 255];
-
-// ---------- 1. night sky ----------
-vgrad(0, 0, W, H, [
-  [0, SKY_TOP],
-  [0.55, SKY_MID],
-  [0.85, SKY_HOR],
-  [1, [10, 26, 51]],
-]);
-
-// faint nebula glows for depth
-glow(200, 150, 230, [42, 30, 94], 0.16);
-glow(900, 520, 270, [14, 58, 74], 0.14);
-glow(450, 700, 210, [26, 42, 94], 0.1);
-
-// stars
-for (let i = 0; i < 240; i++) {
-  const x = rand() * W;
-  const y = rand() * 800;
-  const r = 0.6 + rand() * 1.3;
-  const a = 0.25 + rand() * 0.75;
-  const warm = rand();
-  const c: RGB = warm < 0.2 ? [255, 233, 176] : warm < 0.35 ? [188, 216, 255] : [255, 255, 255];
-  disc(x, y, r, c, a);
+// ---- PNG encoder: filter-0 scanlines, zlib level 9, CRC32 ----
+const CRC_TABLE: Uint32Array = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  CRC_TABLE[n] = c >>> 0;
 }
-// a few sparkles
-for (let i = 0; i < 10; i++) {
-  const x = rand() * W;
-  const y = rand() * 700;
-  const len = 5 + rand() * 7;
-  stroke(
-    [
-      [x - len, y],
-      [x + len, y],
-    ],
-    1.4,
-    [255, 255, 255],
-    0.8,
-  );
-  stroke(
-    [
-      [x, y - len],
-      [x, y + len],
-    ],
-    1.4,
-    [255, 255, 255],
-    0.8,
-  );
-}
-
-// ---------- 2. the moon ----------
-const MOON: Pt = [775, 235];
-glow(MOON[0], MOON[1], 300, MOON_GLOW, 0.3);
-// moon disc with a radial gradient (bright upper-left, deeper gold at the rim)
-for (let y = Math.floor(MOON[1] - 142); y <= Math.ceil(MOON[1] + 142); y++) {
-  for (let x = Math.floor(MOON[0] - 142); x <= Math.ceil(MOON[0] + 142); x++) {
-    const d = Math.hypot(x + 0.5 - MOON[0], y + 0.5 - MOON[1]);
-    if (d <= 140) {
-      const t = clamp(d / 140, 0, 1);
-      const c = mix(MOON_CORE, MOON_EDGE, t * t);
-      const cov = clamp(140 - d + 0.5, 0, 1);
-      blend(x, y, c, cov);
-    }
-  }
-}
-// craters
-const craters: [number, number, number][] = [
-  [720, 190, 18],
-  [800, 280, 22],
-  [830, 200, 12],
-  [745, 285, 14],
-  [790, 160, 9],
-  [700, 245, 10],
-  [835, 255, 8],
-  [765, 235, 7],
-  [715, 155, 6],
-];
-for (const [cx, cy, r] of craters) {
-  disc(cx, cy, r, [223, 168, 62], 0.28);
-}
-
-// ---------- 3. the whale ----------
-const MOON_PT: Pt = [775, 235];
-const spine = cubic([150, 868], [300, 792], [530, 555], [762, 322], 72);
-const prof: [number, number][] = [
-  [0, 30],
-  [0.08, 55],
-  [0.18, 95],
-  [0.3, 135],
-  [0.45, 182],
-  [0.6, 174],
-  [0.72, 150],
-  [0.85, 112],
-  [0.95, 78],
-  [1, 58],
-];
-function widthAt(t: number): number {
-  for (let i = 0; i + 1 < prof.length; i++) {
-    const [t0, w0] = prof[i];
-    const [t1, w1] = prof[i + 1];
-    if (t >= t0 && t <= t1) {
-      const u = (t - t0) / (t1 - t0);
-      const s = u * u * (3 - 2 * u);
-      return w0 + (w1 - w0) * s;
-    }
-  }
-  return prof[prof.length - 1][1];
-}
-// spine samples with tangents and the two side directions
-const N = 72;
-const centers: Pt[] = spine;
-const backPts: Pt[] = [];
-const bellyPts: Pt[] = [];
-for (let i = 0; i <= N; i++) {
-  const t = i / N;
-  const p = centers[i];
-  const q = centers[Math.min(N, i + 1)];
-  const r = centers[Math.max(0, i - 1)];
-  let tx = q[0] - r[0];
-  let ty = q[1] - r[1];
-  const tl = Math.hypot(tx, ty) || 1;
-  tx /= tl;
-  ty /= tl;
-  // two normals; the back side is the one facing the moon
-  const n1: Pt = [-ty, tx];
-  const n2: Pt = [ty, -tx];
-  const d1 = n1[0] * (MOON_PT[0] - p[0]) + n1[1] * (MOON_PT[1] - p[1]);
-  const back = d1 > 0 ? n1 : n2;
-  const belly: Pt = [-back[0], -back[1]];
-  const w = widthAt(t) / 2;
-  backPts.push([p[0] + back[0] * w, p[1] + back[1] * w]);
-  bellyPts.push([p[0] + belly[0] * w, p[1] + belly[1] * w]);
-}
-// head cap: arc around the snout through the tip direction
-const head = centers[N];
-const headTan: Pt = (() => {
-  const q = centers[N];
-  const r = centers[N - 1];
-  const l = Math.hypot(q[0] - r[0], q[1] - r[1]) || 1;
-  return [(q[0] - r[0]) / l, (q[1] - r[1]) / l];
-})();
-const capR = widthAt(1) / 2;
-const aL = Math.atan2(backPts[N][1] - head[1], backPts[N][0] - head[0]);
-const aR = Math.atan2(bellyPts[N][1] - head[1], bellyPts[N][0] - head[0]);
-const aTip = Math.atan2(headTan[1], headTan[0]);
-// walk the short way from aL to aR through aTip
-function angDiff(a: number, b: number): number {
-  let d = (b - a) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
-const capPts: Pt[] = [];
-const total = angDiff(aL, aR);
-const steps = 14;
-for (let i = 0; i <= steps; i++) {
-  const a = aL + (total * i) / steps;
-  capPts.push([head[0] + Math.cos(a) * capR, head[1] + Math.sin(a) * capR]);
-}
-// tail flukes first (they sit behind the body)
-const S = centers[0];
-const tan0: Pt = (() => {
-  const q = centers[1];
-  const l = Math.hypot(q[0] - S[0], q[1] - S[1]) || 1;
-  return [(q[0] - S[0]) / l, (q[1] - S[1]) / l];
-})();
-const perpUp: Pt = [-tan0[1], tan0[0]]; // points away from the moon side here
-const perpDown: Pt = [tan0[1], -tan0[0]];
-function fluke(tip: Pt, perp: Pt): Pt[] {
-  const b1: Pt = [S[0] + tan0[0] * 14, S[1] + tan0[1] * 14];
-  const b2: Pt = [S[0] - tan0[0] * 14, S[1] - tan0[1] * 14];
-  const c1: Pt = [S[0] + perp[0] * 95 + tan0[0] * 70, S[1] + perp[1] * 95 + tan0[1] * 70];
-  const c2: Pt = [S[0] + perp[0] * 75 - tan0[0] * 15, S[1] + perp[1] * 75 - tan0[1] * 15];
-  return [b1, ...quad(b1, c1, tip, 12).slice(1), ...quad(tip, c2, b2, 12).slice(1)];
-}
-const tipUp: Pt = [S[0] + perpUp[0] * 135 + tan0[0] * 55, S[1] + perpUp[1] * 135 + tan0[1] * 55];
-const tipDown: Pt = [S[0] + perpDown[0] * 125 + tan0[0] * 45, S[1] + perpDown[1] * 125 + tan0[1] * 45];
-fillPoly(fluke(tipUp, perpUp), WHALE_BACK, 1);
-fillPoly(fluke(tipDown, perpDown), WHALE_BACK, 1);
-// body
-const bodyPoly: Pt[] = [...backPts, ...capPts, ...bellyPts.slice().reverse()];
-fillPoly(bodyPoly, WHALE_BACK, 1);
-// pectoral fin (belly side, mid-body)
-const midI = Math.floor(N * 0.55);
-const midC = centers[midI];
-const midBelly: Pt = [
-  bellyPts[midI][0] - midC[0],
-  bellyPts[midI][1] - midC[1],
-];
-const midBellyN: Pt = (() => {
-  const l = Math.hypot(midBelly[0], midBelly[1]) || 1;
-  return [midBelly[0] / l, midBelly[1] / l];
-})();
-const finBase: Pt = [midC[0] + midBellyN[0] * widthAt(0.55) * 0.3, midC[1] + midBellyN[1] * widthAt(0.55) * 0.3];
-const finTip: Pt = [finBase[0] + midBellyN[0] * 100 - 25, finBase[1] + midBellyN[1] * 100 + 15];
-const finSide: Pt = [midBellyN[1], -midBellyN[0]];
-const finPoly: Pt[] = [
-  [finBase[0] + finSide[0] * 22, finBase[1] + finSide[1] * 22],
-  ...quad(
-    [finBase[0] + finSide[0] * 22, finBase[1] + finSide[1] * 22],
-    [finBase[0] + midBellyN[0] * 55 + finSide[0] * 18, finBase[1] + midBellyN[1] * 55 + finSide[1] * 18],
-    finTip,
-    10,
-  ).slice(1),
-  ...quad(
-    finTip,
-    [finBase[0] + midBellyN[0] * 55 - finSide[0] * 18, finBase[1] + midBellyN[1] * 55 - finSide[1] * 18],
-    [finBase[0] - finSide[0] * 22, finBase[1] - finSide[1] * 22],
-    10,
-  ).slice(1),
-];
-fillPoly(finPoly, WHALE_BACK, 1);
-// belly band (pale underside)
-const bellyBand: Pt[] = [];
-for (let i = Math.floor(N * 0.12); i <= Math.floor(N * 0.98); i++) {
-  const t = i / N;
-  const p = centers[i];
-  const dir: Pt = [bellyPts[i][0] - p[0], bellyPts[i][1] - p[1]];
-  const l = Math.hypot(dir[0], dir[1]) || 1;
-  bellyBand.push([p[0] + (dir[0] / l) * widthAt(t) * 0.46, p[1] + (dir[1] / l) * widthAt(t) * 0.46]);
-}
-for (let i = Math.floor(N * 0.98); i >= Math.floor(N * 0.12); i--) {
-  const t = i / N;
-  const p = centers[i];
-  const dir: Pt = [bellyPts[i][0] - p[0], bellyPts[i][1] - p[1]];
-  const l = Math.hypot(dir[0], dir[1]) || 1;
-  bellyBand.push([p[0] + (dir[0] / l) * widthAt(t) * 0.06, p[1] + (dir[1] / l) * widthAt(t) * 0.06]);
-}
-fillPoly(bellyBand, WHALE_BELLY, 0.95);
-// rim light along the back edge (moon side)
-stroke(backPts.slice(2), 15, RIM, 0.16);
-stroke(backPts.slice(2), 6, RIM, 0.9);
-// soft edge on the belly side
-stroke(bellyPts.slice(2), 2.5, WHALE_BELLY, 0.35);
-// eye
-const eyeI = Math.floor(N * 0.93);
-const eyeC = centers[eyeI];
-const eyeDir: Pt = [backPts[eyeI][0] - eyeC[0], backPts[eyeI][1] - eyeC[1]];
-const eyeL = Math.hypot(eyeDir[0], eyeDir[1]) || 1;
-const eye: Pt = [eyeC[0] + (eyeDir[0] / eyeL) * widthAt(0.93) * 0.2, eyeC[1] + (eyeDir[1] / eyeL) * widthAt(0.93) * 0.2];
-disc(eye[0], eye[1], 8, [6, 16, 31], 1);
-disc(eye[0] - 2.5, eye[1] - 2.5, 2.2, [255, 255, 255], 0.95);
-// mouth line along the lower head
-const mouth = quad(
-  [centers[Math.floor(N * 0.99)][0] + (bellyPts[Math.floor(N * 0.99)][0] - centers[Math.floor(N * 0.99)][0]) * 0.3,
-   centers[Math.floor(N * 0.99)][1] + (bellyPts[Math.floor(N * 0.99)][1] - centers[Math.floor(N * 0.99)][1]) * 0.3],
-  [centers[Math.floor(N * 0.9)][0] + (bellyPts[Math.floor(N * 0.9)][0] - centers[Math.floor(N * 0.9)][0]) * 0.55,
-   centers[Math.floor(N * 0.9)][1] + (bellyPts[Math.floor(N * 0.9)][1] - centers[Math.floor(N * 0.9)][1]) * 0.55],
-  [centers[Math.floor(N * 0.78)][0] + (bellyPts[Math.floor(N * 0.78)][0] - centers[Math.floor(N * 0.78)][0]) * 0.5,
-   centers[Math.floor(N * 0.78)][1] + (bellyPts[Math.floor(N * 0.78)][1] - centers[Math.floor(N * 0.78)][1]) * 0.5],
-  24,
-);
-stroke(mouth, 4, [8, 22, 45], 0.85);
-// throat grooves on the belly near the head
-for (let k = 0; k < 3; k++) {
-  const ti = Math.floor(N * (0.8 + k * 0.05));
-  const p = centers[ti];
-  const dir: Pt = [bellyPts[ti][0] - p[0], bellyPts[ti][1] - p[1]];
-  const l = Math.hypot(dir[0], dir[1]) || 1;
-  const g = quad(
-    [p[0] + (dir[0] / l) * widthAt(ti / N) * 0.08, p[1] + (dir[1] / l) * widthAt(ti / N) * 0.08],
-    [p[0] + (dir[0] / l) * widthAt(ti / N) * 0.3 - 12, p[1] + (dir[1] / l) * widthAt(ti / N) * 0.3 + 8],
-    [p[0] + (dir[0] / l) * widthAt(ti / N) * 0.44, p[1] + (dir[1] / l) * widthAt(ti / N) * 0.44],
-    12,
-  );
-  stroke(g, 3, [127, 178, 217], 0.5);
-}
-// blowhole spray from the top of the head
-const blowBase: Pt = [
-  centers[Math.floor(N * 0.985)][0] + (backPts[Math.floor(N * 0.985)][0] - centers[Math.floor(N * 0.985)][0]) * 0.9,
-  centers[Math.floor(N * 0.985)][1] + (backPts[Math.floor(N * 0.985)][1] - centers[Math.floor(N * 0.985)][1]) * 0.9,
-];
-for (let k = 0; k < 7; k++) {
-  const ang = -Math.PI / 2 + (k - 3) * 0.22;
-  const len = 34 + rand() * 36;
-  stroke(
-    [blowBase, [blowBase[0] + Math.cos(ang) * len, blowBase[1] + Math.sin(ang) * len]],
-    3,
-    [235, 245, 255],
-    0.8,
-  );
-  disc(blowBase[0] + Math.cos(ang) * (len + 6), blowBase[1] + Math.sin(ang) * (len + 6), 2.5, SPRAY, 0.9);
-}
-
-// ---------- 4. the sea (covers the tail below the wave line) ----------
-function waveY(x: number): number {
-  return 862 + 5 * Math.sin(x * 0.021) + 3 * Math.sin(x * 0.047 + 1.7);
-}
-const seaBands: [number, number, RGB][] = [
-  [860, 890, [18, 58, 99]],
-  [890, 920, [15, 50, 86]],
-  [920, 950, [12, 42, 73]],
-  [950, 980, [9, 34, 60]],
-  [980, 1010, [7, 26, 48]],
-  [1010, 1024, [5, 15, 34]],
-];
-for (const [ya, yb, c] of seaBands) {
-  const pts: Pt[] = [];
-  for (let x = 0; x <= W; x += 8) pts.push([x, ya + (waveY(x) - 862)]);
-  for (let x = W; x >= 0; x -= 8) pts.push([x, yb + (waveY(x) - 862)]);
-  fillPoly(pts, c, 1);
-}
-// wave lines
-for (let k = 0; k < 4; k++) {
-  const yBase = 905 + k * 32;
-  const pts: Pt[] = [];
-  for (let x = 0; x <= W; x += 8) {
-    pts.push([x, yBase + 4 * Math.sin(x * 0.03 + k * 1.9)]);
-  }
-  stroke(pts, 3, [47, 106, 168], 0.3);
-}
-// moon reflection: a shimmering gold column under the moon
-for (let y = 880; y < 1010; y += 13) {
-  const t = (y - 880) / 130;
-  const wdt = 90 * (1 - t) + 25;
-  const jx = (rand() - 0.5) * 26;
-  fillRect(MOON[0] - wdt / 2 + jx, y, wdt, 5, MOON_EDGE, 0.6 * (1 - t) + 0.1);
-}
-// breach foam: arcs + droplets where the tail leaves the water
-const breach: Pt = [195, 860];
-for (const [rr, wd, al] of [
-  [42, 5, 0.75],
-  [66, 4, 0.5],
-  [92, 3, 0.3],
-] as [number, number, number][]) {
-  const arc: Pt[] = [];
-  for (let a = Math.PI * 1.08; a <= Math.PI * 1.92; a += 0.08) {
-    arc.push([breach[0] + Math.cos(a) * rr, breach[1] + Math.sin(a) * rr * 0.55]);
-  }
-  stroke(arc, wd, FOAM, al);
-}
-for (let i = 0; i < 55; i++) {
-  const ang = Math.PI + rand() * Math.PI; // upper fan
-  const rr = 18 + rand() * 125;
-  const x = breach[0] + Math.cos(ang) * rr;
-  const y = breach[1] + Math.sin(ang) * rr * 0.6;
-  disc(x, y, 1 + rand() * 2.8, rand() < 0.5 ? FOAM : SPRAY, 0.55 + rand() * 0.4);
-}
-
-// ---------- 5. the tiny sailboat (the scale joke) ----------
-const boatX = 830;
-const boatY = 912;
-fillPoly(
-  [
-    [boatX - 24, boatY],
-    [boatX + 28, boatY],
-    [boatX + 20, boatY + 13],
-    [boatX - 16, boatY + 13],
-  ],
-  [10, 22, 38],
-  1,
-);
-stroke(
-  [
-    [boatX + 2, boatY],
-    [boatX + 2, boatY - 40],
-  ],
-  3,
-  [10, 22, 38],
-  1,
-);
-fillPoly(
-  [
-    [boatX + 2, boatY - 38],
-    [boatX + 2, boatY - 2],
-    [boatX + 32, boatY - 2],
-  ],
-  [238, 244, 251],
-  0.95,
-);
-disc(boatX - 6, boatY - 6, 2.5, [10, 22, 38], 1);
-
-// birds
-for (const [bx, by, s] of [
-  [300, 215, 18],
-  [352, 178, 14],
-  [248, 262, 12],
-] as [number, number, number][]) {
-  stroke(
-    [
-      [bx - s, by - 4],
-      [bx, by + 2],
-      [bx + s, by - 4],
-    ],
-    2.5,
-    [10, 20, 40],
-    0.85,
-  );
-}
-
-// ---------- 6. the caption ----------
-drawText("HEY JUDGE - HE CAME FOR THE MOON", 48, 44, 3, [220, 234, 255], 0.9);
-
-// ---------- PNG encode (RGB, 8-bit, filter 0) ----------
-const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
-  }
-  return table;
-})();
 function crc32(buf: Buffer): number {
-  let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xff];
-  }
-  return (crc ^ 0xffffffff) >>> 0;
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
 }
-function pngChunk(type: string, data: Buffer): Buffer {
+function chunk(type: string, data: Buffer): Buffer {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length, 0);
-  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
   const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body), 0);
-  return Buffer.concat([len, body, crc]);
+  crc.writeUInt32BE(crc32(td), 0);
+  return Buffer.concat([len, td, crc]);
 }
-
-const raw = Buffer.alloc(H * (1 + W * 3));
-for (let y = 0; y < H; y++) {
-  const ro = y * (1 + W * 3);
-  raw[ro] = 0; // filter: None
-  for (let x = 0; x < W; x++) {
-    const si = (y * W + x) * 3;
-    const di = ro + 1 + x * 3;
-    raw[di] = clamp(Math.round(fb[si]), 0, 255);
-    raw[di + 1] = clamp(Math.round(fb[si + 1]), 0, 255);
-    raw[di + 2] = clamp(Math.round(fb[si + 2]), 0, 255);
+function encodePng(): Buffer {
+  const raw = Buffer.alloc(H * (1 + W * 3));
+  for (let y = 0; y < H; y++) {
+    raw[y * (1 + W * 3)] = 0;
+    raw.set(fb.subarray(y * W * 3, (y + 1) * W * 3), y * (1 + W * 3) + 1);
   }
+  const idat = zlib.deflateSync(raw, { level: 9 });
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type RGB
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return Buffer.concat([
+    sig,
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
 }
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0);
-ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; // bit depth
-ihdr[9] = 2; // color type RGB
-ihdr[10] = 0;
-ihdr[11] = 0;
-ihdr[12] = 0;
-const png = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  pngChunk("IHDR", ihdr),
-  pngChunk("IDAT", deflateSync(raw, { level: 9 })),
-  pngChunk("IEND", Buffer.alloc(0)),
-]);
 
-mkdirSync(OUT_DIR, { recursive: true });
-writeFileSync(OUT_DIR + "/entry.png", png);
-console.log("wrote " + OUT_DIR + "/entry.png (" + png.length + " bytes, " + W + "x" + H + ")");
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+fs.mkdirSync(outDir, { recursive: true });
+fs.writeFileSync(outDir + "/entry.png", encodePng());
